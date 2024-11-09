@@ -47,21 +47,21 @@ from process_memory_writer import MemoryWriter
 writer = MemoryWriter()
 
 # Open a process by name
-success = writer.open_process(process_name="notepad.exe")
+success = writer.open_process("notepad.exe")
 if success:
     print("Process opened successfully")
 else:
     print("Failed to open process")
 
 # Open a process by PID
-success = writer.open_process(pid=1234)
+success = writer.open_process(1234)
 if success:
     print("Process opened successfully")
 else:
     print("Failed to open process")
 
 # Set memory data to write
-writer.set_memory_data(address=0x12345678, data="Hello, World!")
+writer.set_memory_data(0x12345678, b"data")
 
 # Start continuous memory writing
 writer.start()
