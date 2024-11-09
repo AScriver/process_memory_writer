@@ -27,8 +27,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 use windows::Win32::System::ProcessStatus::{GetModuleBaseNameW, K32EnumProcesses};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+};
 
 /// A wrapper around a Windows `HANDLE` that can be safely sent across threads.
 ///
@@ -164,21 +166,28 @@ impl MemoryWriter {
         unsafe {
             let mut process_ids = vec![0u32; 1024];
             let mut bytes_returned = 0u32;
-    
-            if K32EnumProcesses(process_ids.as_mut_ptr(), (process_ids.len() * std::mem::size_of::<u32>()) as u32, &mut bytes_returned).as_bool(){
+
+            if K32EnumProcesses(
+                process_ids.as_mut_ptr(),
+                (process_ids.len() * std::mem::size_of::<u32>()) as u32,
+                &mut bytes_returned,
+            )
+            .as_bool()
+            {
                 let num_processes = bytes_returned as usize / std::mem::size_of::<u32>();
                 process_ids.truncate(num_processes);
-    
+
                 for pid in process_ids {
-                    let handle_result = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+                    let handle_result =
+                        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
                     let handle = handle_result.unwrap();
                     if handle.is_invalid() {
                         continue;
                     }
-    
+
                     let mut process_name_buf = [0u16; MAX_PATH as usize];
                     let name_len = GetModuleBaseNameW(handle, None, &mut process_name_buf);
-    
+
                     if name_len > 0 {
                         let name = String::from_utf16_lossy(&process_name_buf[..name_len as usize]);
                         if name.eq_ignore_ascii_case(&process_name) {
@@ -186,11 +195,11 @@ impl MemoryWriter {
                             return Ok(true);
                         }
                     }
-    
+
                     let _ = CloseHandle(handle);
                 }
             }
-    
+
             Ok(false)
         }
     }

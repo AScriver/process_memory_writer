@@ -5,3 +5,4 @@ __pycache__/
 pyo3/
 cargo.lock
 test.py
+test_requirements.txt
