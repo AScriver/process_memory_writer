@@ -102,9 +102,10 @@ jobs:
       - name: Create GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: |
-          gh release create ${{ github.ref }} \
-            --title "Release ${{ github.ref }}" \
-            --notes "Automated release for ${{ github.ref }}" \
+          gh release create ${{ github.ref }} `
+            --title "Release ${{ github.ref }}" `
+            --notes "Automated release for ${{ github.ref }}" `
             dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        shell: pwsh
