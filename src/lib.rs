@@ -29,7 +29,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows::Win32::System::ProcessStatus::{GetModuleBaseNameW, K32EnumProcesses};
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION, 
+    PROCESS_VM_READ, PROCESS_VM_WRITE,
 };
 
 /// A wrapper around a Windows `HANDLE` that can be safely sent across threads.
@@ -67,10 +68,11 @@ impl Drop for SendableHandle {
 }
 
 impl Clone for SendableHandle {
-    /// Clones the `SendableHandle`, duplicating the `HANDLE`.
+    /// Clones the `SendableHandle`.
     ///
-    /// **Note**: This does not create a new `HANDLE`; it copies the existing `HANDLE` value.
-    /// The underlying handle is shared between clones.
+    /// **Warning**: This creates a shallow copy of the handle value.
+    /// Both instances will refer to the same underlying Windows handle,
+    /// which could lead to double-free issues. Use with caution.
     fn clone(&self) -> Self {
         SendableHandle(self.0)
     }
@@ -153,7 +155,11 @@ impl MemoryWriter {
 
     fn open_process_by_pid(&mut self, pid: u32) -> PyResult<bool> {
         unsafe {
-            let handle = match OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, pid) {
+            let handle = match OpenProcess(
+                PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ,
+                false,
+                pid,
+            ) {
                 Ok(handle) => handle,
                 Err(_) => return Ok(false),
             };
@@ -167,37 +173,45 @@ impl MemoryWriter {
             let mut process_ids = vec![0u32; 1024];
             let mut bytes_returned = 0u32;
 
-            if K32EnumProcesses(
+            if !K32EnumProcesses(
                 process_ids.as_mut_ptr(),
                 (process_ids.len() * std::mem::size_of::<u32>()) as u32,
                 &mut bytes_returned,
             )
             .as_bool()
             {
-                let num_processes = bytes_returned as usize / std::mem::size_of::<u32>();
-                process_ids.truncate(num_processes);
+                return Err(PyErr::new::<PyException, _>("Failed to enumerate processes"));
+            }
 
-                for pid in process_ids {
-                    let handle_result =
-                        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
-                    let handle = handle_result.unwrap();
-                    if handle.is_invalid() {
-                        continue;
-                    }
+            let num_processes = bytes_returned as usize / std::mem::size_of::<u32>();
+            process_ids.truncate(num_processes);
 
-                    let mut process_name_buf = [0u16; MAX_PATH as usize];
-                    let name_len = GetModuleBaseNameW(handle, None, &mut process_name_buf);
+            for pid in process_ids {
+                let handle = match OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) {
+                    Ok(h) if !h.is_invalid() => h,
+                    _ => continue,
+                };
 
-                    if name_len > 0 {
-                        let name = String::from_utf16_lossy(&process_name_buf[..name_len as usize]);
-                        if name.eq_ignore_ascii_case(&process_name) {
-                            self.h_process = Some(Arc::new(SendableHandle::new(handle)));
+                let mut process_name_buf = [0u16; MAX_PATH as usize];
+                let name_len = GetModuleBaseNameW(handle, None, &mut process_name_buf);
+
+                if name_len > 0 {
+                    let name = String::from_utf16_lossy(&process_name_buf[..name_len as usize]);
+                    if name.eq_ignore_ascii_case(&process_name) {
+                        // Need to reopen with proper permissions for writing
+                        let _ = CloseHandle(handle);
+                        if let Ok(write_handle) = OpenProcess(
+                            PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ,
+                            false,
+                            pid,
+                        ) {
+                            self.h_process = Some(Arc::new(SendableHandle::new(write_handle)));
                             return Ok(true);
                         }
                     }
-
-                    let _ = CloseHandle(handle);
                 }
+
+                let _ = CloseHandle(handle);
             }
 
             Ok(false)
@@ -234,6 +248,12 @@ impl MemoryWriter {
                         let data_lock = data.lock().unwrap();
                         data_lock.clone()
                     };
+
+                    // Skip if no data or address is set
+                    if buf.is_empty() || addr == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
 
                     unsafe {
                         let mut bytes_written = 0;
@@ -291,6 +311,17 @@ impl MemoryWriter {
     /// writer.set_memory_data(0x12345678, b'\x90\x90\x90\x90')
     /// ```
     fn set_memory_data(&self, address: usize, data: &[u8]) -> PyResult<()> {
+        // Validate inputs
+        if address == 0 {
+            return Err(PyErr::new::<PyException, _>("Address cannot be null"));
+        }
+        if data.is_empty() {
+            return Err(PyErr::new::<PyException, _>("Data cannot be empty"));
+        }
+        if data.len() > 1024 * 1024 {
+            return Err(PyErr::new::<PyException, _>("Data size too large (max 1MB)"));
+        }
+
         // Update the address and data.
         self.address.store(address as u64, Ordering::SeqCst);
         let mut current_data = self.data.lock().unwrap();
@@ -334,6 +365,53 @@ impl MemoryWriter {
             .map_err(|e| PyErr::new::<PyException, _>(format!("Failed to read memory: {}", e)))?;
         }
         Ok(buffer)
+    }
+
+    /// Checks if the process is still valid and accessible.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` if the process is still running and accessible.
+    /// * `Ok(false)` if the process is no longer accessible.
+    /// * `Err` if no process handle is available.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// if writer.is_process_valid():
+    ///     print("Process is still running")
+    /// ```
+    fn is_process_valid(&self) -> PyResult<bool> {
+        let h_process = self
+            .h_process
+            .as_ref()
+            .ok_or_else(|| PyErr::new::<PyException, _>("Process handle is not available"))?;
+
+        unsafe {
+            use windows::Win32::System::Threading::GetExitCodeProcess;
+            use windows::Win32::Foundation::STILL_ACTIVE;
+            
+            let mut exit_code = 0u32;
+            match GetExitCodeProcess(h_process.0, &mut exit_code) {
+                Ok(_) => Ok(exit_code == STILL_ACTIVE.0 as u32),
+                Err(_) => Ok(false),
+            }
+        }
+    }
+
+    /// Closes the process handle and stops any running worker thread.
+    ///
+    /// # Example
+    ///
+    /// ```python
+    /// writer.close()
+    /// ```
+    fn close(&mut self) {
+        // Stop the worker thread first
+        self.stop();
+        
+        // Clear the process handle (this will automatically close it via Drop)
+        self.h_process = None;
     }
 }
 
